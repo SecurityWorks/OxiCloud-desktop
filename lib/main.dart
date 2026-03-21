@@ -1,8 +1,11 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'core/repositories/auth_repository.dart';
@@ -38,11 +41,39 @@ bool get isDesktop =>
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Show the app immediately with a splash screen so the window becomes
-  // visible. On Windows the native window is only shown after Flutter
-  // renders its first frame (see flutter_window.cpp SetNextFrameCallback).
-  // If we await heavy init before runApp() the window stays invisible.
-  runApp(const OxiCloudBootstrap());
+  // Catch all Flutter framework errors so unhandled exceptions never kill
+  // the process silently.
+  FlutterError.onError = (details) {
+    FlutterError.presentError(details);
+    debugPrint('FlutterError: ${details.exception}');
+    debugPrint('${details.stack}');
+    _writeErrorLog('FlutterError: ${details.exception}\n${details.stack}');
+  };
+
+  // Catch async errors that escape all try-catch blocks.
+  PlatformDispatcher.instance.onError = (error, stack) {
+    debugPrint('PlatformDispatcher uncaught error: $error');
+    debugPrint('$stack');
+    _writeErrorLog('UNCAUGHT: $error\n$stack');
+    return true; // Prevent the runtime from terminating
+  };
+
+  // Wrap the entire app in runZonedGuarded to catch any Dart async errors
+  // that might escape both PlatformDispatcher and FlutterError handlers.
+  runZonedGuarded(
+    () {
+      // Show the app immediately with a splash screen so the window becomes
+      // visible. On Windows the native window is only shown after Flutter
+      // renders its first frame (see flutter_window.cpp SetNextFrameCallback).
+      // If we await heavy init before runApp() the window stays invisible.
+      runApp(const OxiCloudBootstrap());
+    },
+    (error, stack) {
+      debugPrint('Zoned uncaught error: $error');
+      debugPrint('$stack');
+      _writeErrorLog('ZONED: $error\n$stack');
+    },
+  );
 }
 
 /// Write error log to a file for diagnosing release-build failures.
@@ -102,23 +133,29 @@ class _OxiCloudBootstrapState extends State<OxiCloudBootstrap> {
       // initialization steps hang. The window_manager plugin may have hidden
       // the window during native plugin registration.
       if (isDesktop) {
-        try {
-          await windowManager.ensureInitialized();
-          await windowManager.setTitle('OxiCloud');
-          await windowManager.setSize(const Size(1200, 800));
-          await windowManager.setMinimumSize(const Size(800, 600));
-          await windowManager.center();
-          await windowManager.show();
-          await windowManager.focus();
-          debugPrint('OxiCloud: Window shown');
-        } catch (e) {
-          debugPrint('OxiCloud: window_manager early show failed: $e');
-        }
+        await _ensureWindowVisible();
       }
 
-      // THEN: heavy async initialization
+      // Run platform diagnostics before heavy init to surface issues early.
+      if (Platform.isWindows) {
+        _logWindowsDiagnostics();
+      }
+
+      // THEN: heavy async initialization — load the Rust native library.
+      // On Windows the DLL must be resolved relative to the executable, not
+      // the current working directory, because shortcuts / installers may set
+      // a different CWD.
       debugPrint('OxiCloud: Initializing RustLib...');
-      await RustLib.init();
+      try {
+        await RustLib.init(
+          externalLibrary: _loadRustLibrary(),
+        );
+      } catch (e) {
+        debugPrint('OxiCloud: RustLib.init with explicit path failed: $e');
+        // Fallback: let flutter_rust_bridge try its default search
+        debugPrint('OxiCloud: Retrying RustLib.init with default loader...');
+        await RustLib.init();
+      }
       debugPrint('OxiCloud: RustLib initialized successfully');
 
       await configureDependencies();
@@ -142,7 +179,19 @@ class _OxiCloudBootstrapState extends State<OxiCloudBootstrap> {
         } catch (e, stackTrace) {
           debugPrint('Warning: Desktop service init failed: $e');
           debugPrint('$stackTrace');
+          // Non-fatal: the app can still work without tray / close-to-tray
         }
+      }
+
+      // Final safety net on Windows: schedule a delayed re-show in case
+      // a plugin or race condition hid the window during initialization.
+      if (isDesktop && Platform.isWindows) {
+        Future.delayed(const Duration(milliseconds: 500), () async {
+          try {
+            await windowManager.setSkipTaskbar(false);
+            await windowManager.show();
+          } catch (_) {}
+        });
       }
 
       if (mounted) setState(() => _ready = true);
@@ -151,7 +200,102 @@ class _OxiCloudBootstrapState extends State<OxiCloudBootstrap> {
       debugPrint('$stackTrace');
       await _writeErrorLog('$e\n$stackTrace');
       if (mounted) setState(() => _error = e.toString());
+
+      // Make absolutely sure the window is visible so the user can see the
+      // error message, even if the first attempt to show it failed.
+      if (isDesktop) {
+        await _ensureWindowVisible();
+      }
     }
+  }
+
+  /// Show the window using window_manager with multiple retry strategies.
+  Future<void> _ensureWindowVisible() async {
+    try {
+      await windowManager.ensureInitialized();
+      await windowManager.setTitle('OxiCloud');
+      await windowManager.setSize(const Size(1200, 800));
+      await windowManager.setMinimumSize(const Size(800, 600));
+      await windowManager.center();
+      // skipTaskbar: false ensures the app appears in the taskbar
+      await windowManager.setSkipTaskbar(false);
+      await windowManager.show();
+      await windowManager.focus();
+      debugPrint('OxiCloud: Window shown');
+    } catch (e) {
+      debugPrint('OxiCloud: window_manager show failed: $e');
+    }
+  }
+
+  /// Log diagnostics about the Windows environment to help debug startup
+  /// failures (missing DLLs, wrong CWD, missing data directory, etc.).
+  void _logWindowsDiagnostics() {
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      final cwd = Directory.current.path;
+      debugPrint('OxiCloud [diag] exe dir : $exeDir');
+      debugPrint('OxiCloud [diag] CWD     : $cwd');
+
+      // Check critical files
+      final criticalFiles = [
+        '$exeDir\\oxicloud_core.dll',
+        '$exeDir\\flutter_windows.dll',
+        '$exeDir\\data\\flutter_assets\\AssetManifest.json',
+      ];
+      for (final path in criticalFiles) {
+        final exists = File(path).existsSync();
+        debugPrint('OxiCloud [diag] ${exists ? "OK" : "MISSING"}: $path');
+        if (!exists) {
+          _writeErrorLog('DIAGNOSTIC: Missing critical file: $path');
+        }
+      }
+
+      // Check that the data directory exists
+      final dataDir = Directory('$exeDir\\data');
+      if (!dataDir.existsSync()) {
+        debugPrint('OxiCloud [diag] MISSING: data directory at $exeDir\\data');
+        _writeErrorLog('DIAGNOSTIC: Missing data directory: ${dataDir.path}');
+      }
+    } catch (e) {
+      debugPrint('OxiCloud [diag] diagnostics failed: $e');
+    }
+  }
+
+  /// Load the Rust native library from the correct platform-specific path.
+  /// On Windows, when launched from a shortcut, the CWD may differ from the
+  /// exe directory, so we resolve relative to the executable location.
+  ExternalLibrary? _loadRustLibrary() {
+    try {
+      if (Platform.isWindows) {
+        final exeDir = File(Platform.resolvedExecutable).parent.path;
+        final dllPath = '$exeDir\\oxicloud_core.dll';
+        debugPrint('OxiCloud: Loading Rust DLL from: $dllPath');
+        if (File(dllPath).existsSync()) {
+          return ExternalLibrary.open(dllPath);
+        }
+        debugPrint('OxiCloud: DLL not found at $dllPath, falling back');
+      } else if (Platform.isLinux) {
+        final exeDir = File(Platform.resolvedExecutable).parent.path;
+        final soPath = '$exeDir/lib/liboxicloud_core.so';
+        if (File(soPath).existsSync()) {
+          return ExternalLibrary.open(soPath);
+        }
+        // Try next to the executable
+        final soPath2 = '$exeDir/liboxicloud_core.so';
+        if (File(soPath2).existsSync()) {
+          return ExternalLibrary.open(soPath2);
+        }
+      } else if (Platform.isMacOS) {
+        final exeDir = File(Platform.resolvedExecutable).parent.path;
+        final dylibPath = '$exeDir/../Frameworks/liboxicloud_core.dylib';
+        if (File(dylibPath).existsSync()) {
+          return ExternalLibrary.open(dylibPath);
+        }
+      }
+    } catch (e) {
+      debugPrint('OxiCloud: Could not pre-load Rust library: $e');
+    }
+    return null; // Let FRB use its default loader
   }
 
   @override
@@ -160,13 +304,62 @@ class _OxiCloudBootstrapState extends State<OxiCloudBootstrap> {
       return MaterialApp(
         debugShowCheckedModeBanner: false,
         home: Scaffold(
+          backgroundColor: const Color(0xFF1A1A2E),
           body: Center(
-            child: Padding(
+            child: SingleChildScrollView(
               padding: const EdgeInsets.all(32),
-              child: SelectableText(
-                'OxiCloud failed to start.\n\n$_error',
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 16, color: Colors.red),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline, size: 64, color: Colors.redAccent),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'OxiCloud failed to start',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.black26,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: SelectableText(
+                      _error!,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontFamily: 'monospace',
+                        color: Colors.redAccent,
+                      ),
+                    ),
+                  ),
+                  if (Platform.isWindows) ...[
+                    const SizedBox(height: 24),
+                    const Text(
+                      'Troubleshooting (Windows):',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    const Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        '1. Reinstall OxiCloud from the official installer\n'
+                        '2. Ensure oxicloud_core.dll is next to OxiCloud.exe\n'
+                        '3. Install Visual C++ Redistributable 2022\n'
+                        '4. Check %APPDATA%\\oxicloud_crash.log for details',
+                        style: TextStyle(fontSize: 14, color: Colors.white60, height: 1.6),
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
           ),
